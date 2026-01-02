@@ -5,13 +5,52 @@
 package repository
 
 import (
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-type Identifier struct {
-	ID        uuid.UUID
-	Slug      string
+type Account struct {
+	ID                    string
+	AccountID             string
+	ProviderID            string
+	UserID                string
+	AccessToken           pgtype.Text
+	RefreshToken          pgtype.Text
+	IDToken               pgtype.Text
+	AccessTokenExpiresAt  pgtype.Timestamp
+	RefreshTokenExpiresAt pgtype.Timestamp
+	Scope                 pgtype.Text
+	Password              pgtype.Text
+	CreatedAt             pgtype.Timestamp
+	UpdatedAt             pgtype.Timestamp
+}
+
+type Session struct {
+	ID        string
+	ExpiresAt pgtype.Timestamp
+	Token     string
 	CreatedAt pgtype.Timestamp
 	UpdatedAt pgtype.Timestamp
+	IpAddress pgtype.Text
+	UserAgent pgtype.Text
+	UserID    string
+}
+
+type User struct {
+	ID            string
+	Identifier    string
+	Name          string
+	Email         string
+	EmailVerified bool
+	Image         pgtype.Text
+	CreatedAt     pgtype.Timestamp
+	UpdatedAt     pgtype.Timestamp
+}
+
+type Verification struct {
+	ID         string
+	Identifier string
+	Value      string
+	ExpiresAt  pgtype.Timestamp
+	CreatedAt  pgtype.Timestamp
+	UpdatedAt  pgtype.Timestamp
 }
