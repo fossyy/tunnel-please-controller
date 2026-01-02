@@ -33,7 +33,10 @@ func main() {
 	}(connect, ctx)
 
 	repo := repository.New(connect)
-	s := server.New(repo)
+	s := server.New(repo, "test_auth_key")
+
+	log.SetOutput(os.Stdout)
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
 	log.Printf("Listening on :8080\n")
 	err = s.ListenAndServe(":8080")
