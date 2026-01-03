@@ -37,7 +37,7 @@ type Session struct {
 
 type User struct {
 	ID            string
-	Identifier    string
+	SshIdentifier string
 	Name          string
 	Email         string
 	EmailVerified bool

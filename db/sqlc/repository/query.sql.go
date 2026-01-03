@@ -9,17 +9,16 @@ import (
 	"context"
 )
 
-const userExistsByIdentifier = `-- name: UserExistsByIdentifier :one
-SELECT EXISTS (
-    SELECT 1
-    FROM public."user"
-    WHERE identifier = $1
-) AS exists
+const getVerifiedEmailBySSHIdentifier = `-- name: GetVerifiedEmailBySSHIdentifier :one
+SELECT email
+FROM public."user"
+WHERE ssh_identifier = $1
+  AND email_verified = true
 `
 
-func (q *Queries) UserExistsByIdentifier(ctx context.Context, identifier string) (bool, error) {
-	row := q.db.QueryRow(ctx, userExistsByIdentifier, identifier)
-	var exists bool
-	err := row.Scan(&exists)
-	return exists, err
+func (q *Queries) GetVerifiedEmailBySSHIdentifier(ctx context.Context, sshIdentifier string) (string, error) {
+	row := q.db.QueryRow(ctx, getVerifiedEmailBySSHIdentifier, sshIdentifier)
+	var email string
+	err := row.Scan(&email)
+	return email, err
 }

@@ -1,6 +1,5 @@
--- name: UserExistsByIdentifier :one
-SELECT EXISTS (
-    SELECT 1
-    FROM public."user"
-    WHERE identifier = $1
-) AS exists;
+-- name: GetVerifiedEmailBySSHIdentifier :one
+SELECT email
+FROM public."user"
+WHERE ssh_identifier = $1
+  AND email_verified = true;

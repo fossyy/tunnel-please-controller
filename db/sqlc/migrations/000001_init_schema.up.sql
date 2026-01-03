@@ -2,7 +2,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 CREATE TABLE IF NOT EXISTS public."user" (
     id text NOT NULL,
-    identifier text UNIQUE NOT NULL DEFAULT substr(encode(gen_random_bytes(16), 'hex'), 1, 32),
+    ssh_identifier text UNIQUE NOT NULL DEFAULT substr(encode(gen_random_bytes(16), 'hex'), 1, 32),
     name text NOT NULL,
     email text NOT NULL,
     email_verified boolean DEFAULT false NOT NULL,
