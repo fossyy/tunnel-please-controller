@@ -2,8 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"git.fossy.my.id/bagas/tunnel-please-controller/db/sqlc/repository"
 	"git.fossy.my.id/bagas/tunnel-please-controller/server"
@@ -18,9 +23,26 @@ func main() {
 		}
 	}
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	connect, err := pgx.Connect(ctx, os.Getenv("DATABASE_URL"))
+	log.SetOutput(os.Stdout)
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		log.Fatal("DATABASE_URL is required")
+	}
+
+	controllerAddr := getenv("CONTROLLER_ADDR", ":8080")
+	apiAddr := getenv("API_ADDR", ":8081")
+	authToken := getenv("AUTH_TOKEN", "")
+	if authToken == "" {
+		authToken = generateAuthToken()
+		log.Printf("No AUTH_TOKEN provided. Generated token: %s", authToken)
+	}
+
+	connect, err := pgx.Connect(ctx, dbURL)
 	if err != nil {
 		panic(err)
 		return
@@ -33,15 +55,44 @@ func main() {
 	}(connect, ctx)
 
 	repo := repository.New(connect)
-	s := server.New(repo, "test_auth_key")
+	s := server.New(repo, authToken)
 
-	log.SetOutput(os.Stdout)
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.Printf("Listening controller on %s", controllerAddr)
+	log.Printf("Listening api on %s", apiAddr)
 
-	log.Printf("Listening on :8080\n")
-	err = s.ListenAndServe(":8080")
-	if err != nil {
-		panic(err)
-		return
+	errCh := make(chan error, 2)
+
+	go func() {
+		if err := s.StartAPI(ctx, apiAddr); err != nil && !errors.Is(err, context.Canceled) {
+			errCh <- err
+		}
+	}()
+
+	go func() {
+		if err := s.StartController(ctx, controllerAddr); err != nil && !errors.Is(err, context.Canceled) {
+			errCh <- err
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		log.Printf("shutting down: %v", ctx.Err())
+	case err := <-errCh:
+		log.Fatalf("server error: %v", err)
 	}
+}
+
+func getenv(key, def string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return def
+}
+
+func generateAuthToken() string {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		panic(err)
+	}
+	return base64.StdEncoding.EncodeToString(buf)
 }
