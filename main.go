@@ -20,7 +20,7 @@ import (
 
 func main() {
 	if _, err := os.Stat(".env"); err == nil {
-		if err := godotenv.Load(".env"); err != nil {
+		if err = godotenv.Load(".env"); err != nil {
 			log.Printf("Warning: Failed to load .env file: %s", err)
 		}
 	}
@@ -50,7 +50,7 @@ func main() {
 		return
 	}
 	defer func(connect *pgx.Conn, ctx context.Context) {
-		err := connect.Close(ctx)
+		err = connect.Close(ctx)
 		if err != nil {
 			panic(err)
 		}
@@ -70,13 +70,13 @@ func main() {
 	errCh := make(chan error, 2)
 
 	go func() {
-		if err := s.StartAPI(ctx, apiAddr); err != nil && !errors.Is(err, context.Canceled) {
+		if err = s.StartAPI(ctx, apiAddr); err != nil && !errors.Is(err, context.Canceled) {
 			errCh <- err
 		}
 	}()
 
 	go func() {
-		if err := s.StartController(ctx, controllerAddr); err != nil && !errors.Is(err, context.Canceled) {
+		if err = s.StartController(ctx, controllerAddr); err != nil && !errors.Is(err, context.Canceled) {
 			errCh <- err
 		}
 	}()
@@ -84,7 +84,7 @@ func main() {
 	select {
 	case <-ctx.Done():
 		log.Printf("shutting down: %v", ctx.Err())
-	case err := <-errCh:
+	case err = <-errCh:
 		log.Fatalf("server error: %v", err)
 	}
 }

@@ -28,6 +28,7 @@ import (
 
 const (
 	defaultSubscriberResponseWait = 5 * time.Second
+	jwkRegisterTimeout            = 5 * time.Second
 )
 
 type Subscriber struct {
@@ -352,10 +353,12 @@ func (s *Server) StartAPI(ctx context.Context, Addr string) error {
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
-
 	jwkURL := config.Getenv("JWKS_URL", "")
 	if jwkURL != "" {
-		if err := s.jwkCache.Register(ctx, jwkURL); err != nil {
+		registerCtx, cancel := context.WithTimeout(ctx, jwkRegisterTimeout)
+		defer cancel()
+
+		if err := s.jwkCache.Register(registerCtx, jwkURL); err != nil {
 			return fmt.Errorf("failed to register jwk cache: %w", err)
 		}
 	}
