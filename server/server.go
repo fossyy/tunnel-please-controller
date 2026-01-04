@@ -45,7 +45,6 @@ type Server struct {
 	authToken   string
 	jwkCache    *jwk.Cache
 	proto.UnimplementedEventServiceServer
-	proto.UnimplementedSlugChangeServer
 	proto.UnimplementedUserServiceServer
 }
 
@@ -244,46 +243,6 @@ func (s *Server) GetEventSubscriber(identity string) (*Subscriber, error) {
 	return req, nil
 }
 
-func (s *Server) RequestChangeSlug(ctx context.Context, request *proto.ChangeSlugRequest) (*proto.ChangeSlugResponse, error) {
-	if request == nil {
-		return nil, status.Error(codes.InvalidArgument, "request is nil")
-	}
-	if request.GetNode() == "" {
-		return nil, status.Error(codes.InvalidArgument, "node is required")
-	}
-	if request.Old == "" || request.New == "" {
-		return nil, status.Error(codes.InvalidArgument, "old and new slugs are required")
-	}
-
-	subscriber, err := s.GetEventSubscriber(request.GetNode())
-	if err != nil {
-		return nil, err
-	}
-
-	controllerMsg := &proto.Events{
-		Type: proto.EventType_SLUG_CHANGE,
-		Payload: &proto.Events_SlugEvent{
-			SlugEvent: &proto.SlugChangeEvent{
-				Old: request.Old,
-				New: request.New,
-			},
-		},
-	}
-
-	resp, err := s.sendAndReceive(ctx, subscriber, controllerMsg, defaultSubscriberResponseWait)
-	if err != nil {
-		return nil, err
-	}
-	if resp == nil {
-		return nil, status.Error(codes.FailedPrecondition, "empty response from client")
-	}
-	response, ok := resp.Payload.(*proto.Node_SlugEventResponse)
-	if !ok || response == nil || response.SlugEventResponse == nil {
-		return nil, status.Error(codes.FailedPrecondition, "invalid slug response payload")
-	}
-	return (*proto.ChangeSlugResponse)(response.SlugEventResponse), nil
-}
-
 type SubscriberResult struct {
 	Identity string
 	Response *proto.Node
@@ -344,6 +303,11 @@ func (s *Server) notifyAllSubscriber(ctx context.Context, recvChan <-chan *proto
 	}
 }
 
+type Slug struct {
+	Old string `json:"old"`
+	New string `json:"new"`
+}
+
 func (s *Server) StartAPI(ctx context.Context, Addr string) error {
 	handler := http.NewServeMux()
 	httpServer := http.Server{
@@ -362,6 +326,91 @@ func (s *Server) StartAPI(ctx context.Context, Addr string) error {
 			return fmt.Errorf("failed to register jwk cache: %w", err)
 		}
 	}
+	handler.HandleFunc("PATCH /api/session/{node}", func(writer http.ResponseWriter, request *http.Request) {
+		writeError := func(status int, msg string) {
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(status)
+			_ = json.NewEncoder(writer).Encode(map[string]string{"error": msg})
+		}
+
+		var token jwt.Token
+		var err error
+		if jwkURL != "" {
+			keyset, err := s.jwkCache.Lookup(request.Context(), jwkURL)
+			if err != nil {
+				log.Printf("jwks lookup failed: %v", err)
+				writeError(http.StatusBadGateway, "unable to fetch jwks")
+				return
+			}
+
+			token, err = jwt.ParseRequest(request, jwt.WithKeySet(keyset))
+			if err != nil {
+				log.Printf("jwt parse failed: %v", err)
+				writeError(http.StatusUnauthorized, "invalid or expired token")
+				return
+			}
+		} else {
+			token, err = jwt.ParseRequest(request, jwt.WithVerify(false))
+			if err != nil {
+				log.Printf("jwt parse failed (no verification): %v", err)
+				writeError(http.StatusBadRequest, "invalid token")
+				return
+			}
+		}
+
+		var email string
+		err = token.Get("email", &email)
+		if err != nil {
+			log.Printf("email claim not found: %v", err)
+			writeError(http.StatusBadRequest, "missing email claim in token")
+			return
+		}
+		if email == "" {
+			writeError(http.StatusBadRequest, "empty email claim in token")
+			return
+		}
+		node := request.PathValue("node")
+		if node == "" {
+			writeError(http.StatusBadRequest, "no node specified")
+			return
+		}
+		var slug *Slug
+		if err := json.NewDecoder(request.Body).Decode(&slug); err != nil {
+			writeError(http.StatusBadRequest, "invalid request body")
+			return
+		}
+		subscriber, err := s.GetEventSubscriber(node)
+		if err != nil {
+			writeError(http.StatusBadRequest, "no node found")
+			return
+		}
+
+		subscriber.events <- &proto.Events{
+			Type: proto.EventType_SLUG_CHANGE,
+			Payload: &proto.Events_SlugEvent{
+				SlugEvent: &proto.SlugChangeEvent{
+					Old: slug.Old,
+					New: slug.New,
+				},
+			},
+		}
+
+		select {
+		case response := <-subscriber.node:
+			resp, ok := response.Payload.(*proto.Node_SlugEventResponse)
+			if !ok {
+				writeError(http.StatusInternalServerError, "received an unexpected response from the node")
+				return
+			}
+			if !resp.SlugEventResponse.Success {
+				writeError(http.StatusBadRequest, resp.SlugEventResponse.Message)
+				return
+			}
+			log.Printf("Received slug change response: %v", response)
+			writer.WriteHeader(http.StatusNoContent)
+		case <-request.Context().Done():
+		}
+	})
 
 	handler.HandleFunc("/api/sessions", func(writer http.ResponseWriter, request *http.Request) {
 		writeError := func(status int, msg string) {
@@ -518,7 +567,6 @@ func (s *Server) StartController(ctx context.Context, Addr string) error {
 	)
 	reflection.Register(grpcServer)
 
-	proto.RegisterSlugChangeServer(grpcServer, s)
 	proto.RegisterEventServiceServer(grpcServer, s)
 	proto.RegisterUserServiceServer(grpcServer, s)
 
