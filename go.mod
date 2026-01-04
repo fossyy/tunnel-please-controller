@@ -31,5 +31,3 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251222181119-0a764e51fe1b // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
-
-replace git.fossy.my.id/bagas/tunnel-please-grpc => ../tunnel-please-grpc
