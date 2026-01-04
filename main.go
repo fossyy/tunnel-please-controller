@@ -14,6 +14,8 @@ import (
 	"git.fossy.my.id/bagas/tunnel-please-controller/server"
 	"github.com/jackc/pgx/v5"
 	"github.com/joho/godotenv"
+	"github.com/lestrrat-go/httprc/v3"
+	"github.com/lestrrat-go/jwx/v3/jwk"
 )
 
 func main() {
@@ -55,7 +57,12 @@ func main() {
 	}(connect, ctx)
 
 	repo := repository.New(connect)
-	s := server.New(repo, authToken)
+	client := httprc.NewClient()
+	jwkCache, err := jwk.NewCache(ctx, client)
+	if err != nil {
+		log.Printf("failed to initialize jwk cache : %s", err)
+	}
+	s := server.New(repo, authToken, jwkCache)
 
 	log.Printf("Listening controller on %s", controllerAddr)
 	log.Printf("Listening api on %s", apiAddr)

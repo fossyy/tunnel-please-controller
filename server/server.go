@@ -13,7 +13,10 @@ import (
 	"time"
 
 	"git.fossy.my.id/bagas/tunnel-please-controller/db/sqlc/repository"
+	"git.fossy.my.id/bagas/tunnel-please-controller/internal/config"
 	proto "git.fossy.my.id/bagas/tunnel-please-grpc/gen"
+	"github.com/lestrrat-go/jwx/v3/jwk"
+	"github.com/lestrrat-go/jwx/v3/jwt"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health"
@@ -39,17 +42,19 @@ type Server struct {
 	Subscribers map[string]*Subscriber
 	mu          *sync.RWMutex
 	authToken   string
+	jwkCache    *jwk.Cache
 	proto.UnimplementedEventServiceServer
 	proto.UnimplementedSlugChangeServer
 	proto.UnimplementedUserServiceServer
 }
 
-func New(database *repository.Queries, authToken string) *Server {
+func New(database *repository.Queries, authToken string, jwkCache *jwk.Cache) *Server {
 	return &Server{
 		Database:    database,
 		Subscribers: make(map[string]*Subscriber),
 		mu:          new(sync.RWMutex),
 		authToken:   authToken,
+		jwkCache:    jwkCache,
 	}
 }
 
@@ -348,14 +353,63 @@ func (s *Server) StartAPI(ctx context.Context, Addr string) error {
 		IdleTimeout:  60 * time.Second,
 	}
 
+	jwkURL := config.Getenv("JWKS_URL", "")
+	if jwkURL != "" {
+		if err := s.jwkCache.Register(ctx, jwkURL); err != nil {
+			return fmt.Errorf("failed to register jwk cache: %w", err)
+		}
+	}
+
 	handler.HandleFunc("/api/sessions", func(writer http.ResponseWriter, request *http.Request) {
-		identity := request.URL.Query().Get("identity")
+		writeError := func(status int, msg string) {
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(status)
+			_ = json.NewEncoder(writer).Encode(map[string]string{"error": msg})
+		}
+
+		var token jwt.Token
+		var err error
+		if jwkURL != "" {
+			keyset, err := s.jwkCache.Lookup(request.Context(), jwkURL)
+			if err != nil {
+				log.Printf("jwks lookup failed: %v", err)
+				writeError(http.StatusBadGateway, "unable to fetch jwks")
+				return
+			}
+
+			token, err = jwt.ParseRequest(request, jwt.WithKeySet(keyset))
+			if err != nil {
+				log.Printf("jwt parse failed: %v", err)
+				writeError(http.StatusUnauthorized, "invalid or expired token")
+				return
+			}
+		} else {
+			token, err = jwt.ParseRequest(request, jwt.WithVerify(false))
+			if err != nil {
+				log.Printf("jwt parse failed (no verification): %v", err)
+				writeError(http.StatusBadRequest, "invalid token")
+				return
+			}
+		}
+
+		var email string
+		err = token.Get("email", &email)
+		if err != nil {
+			log.Printf("email claim not found: %v", err)
+			writeError(http.StatusBadRequest, "missing email claim in token")
+			return
+		}
+		if email == "" {
+			writeError(http.StatusBadRequest, "empty email claim in token")
+			return
+		}
+
 		results := s.broadcastAndCollect(request.Context(), func(ctx context.Context, subscriber *Subscriber) (interface{}, bool) {
 			receive, err := s.sendAndReceive(ctx, subscriber, &proto.Events{
 				Type: proto.EventType_GET_SESSIONS,
 				Payload: &proto.Events_GetSessionsEvent{
 					GetSessionsEvent: &proto.GetSessionsEvent{
-						Identity: identity,
+						Identity: email,
 					},
 				},
 			}, defaultSubscriberResponseWait)
@@ -382,18 +436,20 @@ func (s *Server) StartAPI(ctx context.Context, Addr string) error {
 		if len(flatten) == 0 {
 			_, err := writer.Write([]byte("[]"))
 			if err != nil {
-				return
+				log.Printf("write empty sessions response failed: %v", err)
 			}
 			return
 		}
 
 		marshal, err := json.Marshal(flatten)
 		if err != nil {
-			http.Error(writer, "failed to marshal sessions", http.StatusInternalServerError)
+			log.Printf("marshal sessions failed: %v", err)
+			writeError(http.StatusInternalServerError, "failed to marshal sessions")
 			return
 		}
 		_, err = writer.Write(marshal)
 		if err != nil {
+			log.Printf("write sessions response failed: %v", err)
 			return
 		}
 	})
