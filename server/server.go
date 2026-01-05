@@ -389,8 +389,9 @@ func (s *Server) StartAPI(ctx context.Context, Addr string) error {
 			Type: proto.EventType_SLUG_CHANGE,
 			Payload: &proto.Events_SlugEvent{
 				SlugEvent: &proto.SlugChangeEvent{
-					Old: slug.Old,
-					New: slug.New,
+					User: email,
+					Old:  slug.Old,
+					New:  slug.New,
 				},
 			},
 		}
