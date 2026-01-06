@@ -169,6 +169,21 @@ func processEventStream(ctx context.Context, requestChan *Subscriber, event grpc
 				case requestChan.node <- recv:
 				}
 				log.Printf("Received SESSIONS  event: %v", recv)
+			case proto.EventType_TERMINATE_SESSION:
+				log.Printf("Processing terminate event")
+				if err := event.Send(request); err != nil {
+					return err
+				}
+				recv, err := recvClientWithTimeout(ctx, requestChan.done, event, defaultSubscriberResponseWait)
+				if err != nil {
+					return err
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case requestChan.node <- recv:
+				}
+				log.Printf("Received terminate event: %v", recv)
 			default:
 				log.Printf("Unknown event type: %v", request.GetType())
 			}
@@ -335,8 +350,9 @@ func (s *Server) StartAPI(ctx context.Context, Addr string) error {
 
 		var token jwt.Token
 		var err error
+		var keyset jwk.Set
 		if jwkURL != "" {
-			keyset, err := s.jwkCache.Lookup(request.Context(), jwkURL)
+			keyset, err = s.jwkCache.Lookup(request.Context(), jwkURL)
 			if err != nil {
 				log.Printf("jwks lookup failed: %v", err)
 				writeError(http.StatusBadGateway, "unable to fetch jwks")
@@ -408,6 +424,110 @@ func (s *Server) StartAPI(ctx context.Context, Addr string) error {
 				return
 			}
 			log.Printf("Received slug change response: %v", response)
+			writer.WriteHeader(http.StatusNoContent)
+		case <-request.Context().Done():
+		}
+	})
+
+	handler.HandleFunc("DELETE /api/session/{node}/{type}/{session}", func(writer http.ResponseWriter, request *http.Request) {
+		writeError := func(status int, msg string) {
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(status)
+			_ = json.NewEncoder(writer).Encode(map[string]string{"error": msg})
+		}
+
+		var token jwt.Token
+		var err error
+		var keyset jwk.Set
+		if jwkURL != "" {
+			keyset, err = s.jwkCache.Lookup(request.Context(), jwkURL)
+			if err != nil {
+				log.Printf("jwks lookup failed: %v", err)
+				writeError(http.StatusBadGateway, "unable to fetch jwks")
+				return
+			}
+
+			token, err = jwt.ParseRequest(request, jwt.WithKeySet(keyset))
+			if err != nil {
+				log.Printf("jwt parse failed: %v", err)
+				writeError(http.StatusUnauthorized, "invalid or expired token")
+				return
+			}
+		} else {
+			token, err = jwt.ParseRequest(request, jwt.WithVerify(false))
+			if err != nil {
+				log.Printf("jwt parse failed (no verification): %v", err)
+				writeError(http.StatusBadRequest, "invalid token")
+				return
+			}
+		}
+
+		var email string
+		err = token.Get("email", &email)
+		if err != nil {
+			log.Printf("email claim not found: %v", err)
+			writeError(http.StatusBadRequest, "missing email claim in token")
+			return
+		}
+		if email == "" {
+			writeError(http.StatusBadRequest, "empty email claim in token")
+			return
+		}
+		node := request.PathValue("node")
+		if node == "" {
+			writeError(http.StatusBadRequest, "no node specified")
+			return
+		}
+
+		sessionTypeRaw := request.PathValue("type")
+		if node == "" {
+			writeError(http.StatusBadRequest, "no type specified")
+			return
+		}
+
+		var tunnelType proto.TunnelType
+		if sessionTypeRaw == "http" {
+			tunnelType = proto.TunnelType_HTTP
+		} else if sessionTypeRaw == "tcp" {
+			tunnelType = proto.TunnelType_TCP
+		} else {
+			writeError(http.StatusBadRequest, "invalid session type specified")
+			return
+		}
+
+		session := request.PathValue("session")
+		if node == "" {
+			writeError(http.StatusBadRequest, "no node specified")
+			return
+		}
+
+		subscriber, err := s.GetEventSubscriber(node)
+		if err != nil {
+			writeError(http.StatusBadRequest, "no node found")
+			return
+		}
+		subscriber.events <- &proto.Events{
+			Type: proto.EventType_TERMINATE_SESSION,
+			Payload: &proto.Events_TerminateSessionEvent{
+				TerminateSessionEvent: &proto.TerminateSessionEvent{
+					User:       email,
+					TunnelType: tunnelType,
+					Slug:       session,
+				},
+			},
+		}
+		select {
+		case response := <-subscriber.node:
+			resp, ok := response.Payload.(*proto.Node_TerminateSessionEventResponse)
+			if !ok {
+				writeError(http.StatusInternalServerError, "received an unexpected response from the node")
+				return
+			}
+			if !resp.TerminateSessionEventResponse.Success {
+				writeError(http.StatusBadRequest, resp.TerminateSessionEventResponse.Message)
+				return
+			}
+			log.Printf("Received terminate session response: %v", response)
 			writer.WriteHeader(http.StatusNoContent)
 		case <-request.Context().Done():
 		}

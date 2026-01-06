@@ -3,7 +3,7 @@ module git.fossy.my.id/bagas/tunnel-please-controller
 go 1.25.5
 
 require (
-	git.fossy.my.id/bagas/tunnel-please-grpc v1.4.0
+	git.fossy.my.id/bagas/tunnel-please-grpc v1.5.0
 	github.com/jackc/pgx/v5 v5.8.0
 	github.com/joho/godotenv v1.5.1
 	github.com/lestrrat-go/httprc/v3 v3.0.3
