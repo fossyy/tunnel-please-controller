@@ -1,0 +1,60 @@
+on:
+  push:
+    branches:
+      - main
+      - staging
+      - 'feat/**'
+
+name: SonarQube Scan
+jobs:
+  sonarqube:
+    name: SonarQube Trigger
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checking out
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+          cache: false
+
+      - name: Install dependencies
+        run: go mod tidy
+
+      - name: Run go vet
+        run: go vet ./... 2>&1 | tee vet-results.txt
+
+      - name: Run tests with coverage
+        run: |
+          go test ./... -v -p 4 -coverprofile=coverage
+
+      - name: Run GolangCI-Lint Analysis
+        uses: golangci/golangci-lint-action@v9
+        with:
+          skip-cache: true
+          version: v2.6
+          args: >
+            --issues-exit-code=0
+            --output.text.path=stdout
+            --output.checkstyle.path=golangci-lint-report.xml
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v7.0.0
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONARQUBE_HOST }}
+          SONAR_TOKEN: ${{ secrets.SONARQUBE_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=tunnel-please-controller
+            -Dsonar.go.coverage.reportPaths=coverage
+            -Dsonar.test.inclusions=**/*_test.go
+            -Dsonar.test.exclusions=**/vendor/**
+            -Dsonar.exclusions=**/*_test.go,**/vendor/**,**/golangci-lint-report.xml
+            -Dsonar.go.govet.reportPaths=vet-results.txt
+            -Dsonar.go.golangci-lint.reportPaths=golangci-lint-report.xml
+            -Dsonar.sources=./
+            -Dsonar.tests=./

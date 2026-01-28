@@ -47,7 +47,6 @@ func main() {
 	connect, err := pgx.Connect(ctx, dbURL)
 	if err != nil {
 		panic(err)
-		return
 	}
 	defer func(connect *pgx.Conn, ctx context.Context) {
 		err = connect.Close(ctx)

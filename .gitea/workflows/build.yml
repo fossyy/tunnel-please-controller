@@ -2,13 +2,37 @@ name: Docker Build and Push
 
 on:
   push:
-    branches:
-      - main
+    tags:
+      - 'v*'
 
 jobs:
-  build-and-push-branches:
+  test:
+    name: Run Tests
     runs-on: ubuntu-latest
-    if: github.ref_type == 'branch'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+          cache: false
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run tests
+        run: go test -v -p 4 ./...
+
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: test
 
     steps:
       - name: Checkout repository
@@ -17,64 +41,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          registry: git.fossy.my.id
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-
-      - name: Set version variables
-        id: vars
-        run: |
-          if [ "${{ github.ref }}" == "refs/heads/main" ]; then
-            echo "VERSION=dev-main" >> $GITHUB_OUTPUT
-          else
-            echo "VERSION=dev-staging" >> $GITHUB_OUTPUT
-          fi
-          echo "BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
-          echo "COMMIT=${{ github.sha }}" >> $GITHUB_OUTPUT
-
-      - name: Build and push Docker image for main
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: |
-            git.fossy.my.id/${{ secrets.DOCKER_USERNAME }}/tunnel-please-controller:latest
-          platforms: linux/amd64,linux/arm64
-          build-args: |
-            VERSION=${{ steps.vars.outputs.VERSION }}
-            BUILD_DATE=${{ steps.vars.outputs.BUILD_DATE }}
-            COMMIT=${{ steps.vars.outputs.COMMIT }}
-        if: github.ref == 'refs/heads/main'
-
-      - name: Build and push Docker image for staging
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: |
-            git.fossy.my.id/${{ secrets.DOCKER_USERNAME }}/tunnel-please-controller:staging
-          platforms: linux/amd64,linux/arm64
-          build-args: |
-            VERSION=${{ steps.vars.outputs.VERSION }}
-            BUILD_DATE=${{ steps.vars.outputs.BUILD_DATE }}
-            COMMIT=${{ steps.vars.outputs.COMMIT }}
-        if: github.ref == 'refs/heads/staging'
-
-  build-and-push-tags:
-    runs-on: ubuntu-latest
-    if: github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v')
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to Docker Hub
+      - name: Log in to Docker Registry
         uses: docker/login-action@v3
         with:
           registry: git.fossy.my.id
@@ -92,32 +59,35 @@ jobs:
           if echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
             MAJOR=$(echo "$VERSION" | cut -d. -f1)
             MINOR=$(echo "$VERSION" | cut -d. -f2)
+            PATCH=$(echo "$VERSION" | cut -d. -f3 | cut -d- -f1)
           
             echo "MAJOR=$MAJOR" >> $GITHUB_OUTPUT
             echo "MINOR=$MINOR" >> $GITHUB_OUTPUT
+            echo "PATCH=$PATCH" >> $GITHUB_OUTPUT
           
             if echo "$VERSION" | grep -q '-'; then
+              PRERELEASE_TAG=$(echo "$VERSION" | cut -d- -f2 | cut -d. -f1)
               echo "IS_PRERELEASE=true" >> $GITHUB_OUTPUT
-              echo "ADDITIONAL_TAG=staging" >> $GITHUB_OUTPUT
+              echo "PRERELEASE_TAG=$PRERELEASE_TAG" >> $GITHUB_OUTPUT
             else
               echo "IS_PRERELEASE=false" >> $GITHUB_OUTPUT
-              echo "ADDITIONAL_TAG=latest" >> $GITHUB_OUTPUT
             fi
           else
             echo "Invalid version format: $VERSION"
             exit 1
           fi
 
-      - name: Build and push Docker image for release
+      - name: Build and push Docker image (release)
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: |
             git.fossy.my.id/${{ secrets.DOCKER_USERNAME }}/tunnel-please-controller:v${{ steps.version.outputs.VERSION }}
+            git.fossy.my.id/${{ secrets.DOCKER_USERNAME }}/tunnel-please-controller:release
             git.fossy.my.id/${{ secrets.DOCKER_USERNAME }}/tunnel-please-controller:v${{ steps.version.outputs.MAJOR }}.${{ steps.version.outputs.MINOR }}
             git.fossy.my.id/${{ secrets.DOCKER_USERNAME }}/tunnel-please-controller:v${{ steps.version.outputs.MAJOR }}
-            git.fossy.my.id/${{ secrets.DOCKER_USERNAME }}/tunnel-please-controller:${{ steps.version.outputs.ADDITIONAL_TAG }}
+            git.fossy.my.id/${{ secrets.DOCKER_USERNAME }}/tunnel-please-controller:latest
           platforms: linux/amd64,linux/arm64
           build-args: |
             VERSION=${{ steps.version.outputs.VERSION }}
@@ -125,14 +95,14 @@ jobs:
             COMMIT=${{ steps.version.outputs.COMMIT }}
         if: steps.version.outputs.IS_PRERELEASE == 'false'
 
-      - name: Build and push Docker image for pre-release
+      - name: Build and push Docker image (pre-release)
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: |
             git.fossy.my.id/${{ secrets.DOCKER_USERNAME }}/tunnel-please-controller:v${{ steps.version.outputs.VERSION }}
-            git.fossy.my.id/${{ secrets.DOCKER_USERNAME }}/tunnel-please-controller:${{ steps.version.outputs.ADDITIONAL_TAG }}
+            git.fossy.my.id/${{ secrets.DOCKER_USERNAME }}/tunnel-please-controller:staging
           platforms: linux/amd64,linux/arm64
           build-args: |
             VERSION=${{ steps.version.outputs.VERSION }}
