@@ -36,7 +36,7 @@ jobs:
         uses: golangci/golangci-lint-action@v9
         with:
           skip-cache: true
-          version: v2.6
+          version: latest
           args: >
             --issues-exit-code=0
             --output.text.path=stdout
