@@ -1,6 +1,6 @@
 module git.fossy.my.id/bagas/tunnel-please-controller
 
-go 1.25.5
+go 1.26.0
 
 require (
 	git.fossy.my.id/bagas/tunnel-please-grpc v1.5.0
