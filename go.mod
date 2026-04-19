@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	git.fossy.my.id/bagas/tunnel-please-grpc v1.5.0
-	github.com/jackc/pgx/v5 v5.9.1
+	github.com/jackc/pgx/v5 v5.9.2
 	github.com/joho/godotenv v1.5.1
 	github.com/lestrrat-go/httprc/v3 v3.0.5
 	github.com/lestrrat-go/jwx/v3 v3.0.13
