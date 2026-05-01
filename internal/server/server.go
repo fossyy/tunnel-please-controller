@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"git.fossy.my.id/bagas/tunnel-please-controller/db/sqlc/repository"
 	"git.fossy.my.id/bagas/tunnel-please-controller/internal/config"
+	"git.fossy.my.id/bagas/tunnel-please-controller/internal/db/sqlc/repository"
 	proto "git.fossy.my.id/bagas/tunnel-please-grpc/gen"
 	"github.com/lestrrat-go/jwx/v3/jwk"
 	"github.com/lestrrat-go/jwx/v3/jwt"
@@ -42,19 +42,19 @@ type Server struct {
 	Database    *repository.Queries
 	Subscribers map[string]*Subscriber
 	mu          *sync.RWMutex
-	authToken   string
 	jwkCache    *jwk.Cache
+	config      config.Config
 	proto.UnimplementedEventServiceServer
 	proto.UnimplementedUserServiceServer
 }
 
-func New(database *repository.Queries, authToken string, jwkCache *jwk.Cache) *Server {
+func New(database *repository.Queries, jwkCache *jwk.Cache, config config.Config) *Server {
 	return &Server{
 		Database:    database,
 		Subscribers: make(map[string]*Subscriber),
 		mu:          new(sync.RWMutex),
-		authToken:   authToken,
 		jwkCache:    jwkCache,
+		config:      config,
 	}
 }
 
@@ -94,7 +94,7 @@ func (s *Server) Subscribe(event grpc.BidiStreamingServer[proto.Node, proto.Even
 		return status.Error(codes.InvalidArgument, "missing identity")
 	}
 	token := payload.AuthEvent.AuthToken
-	if token != s.authToken {
+	if token != s.config.AuthToken() {
 		return status.Error(codes.Unauthenticated, "invalid auth token")
 	}
 
@@ -332,7 +332,7 @@ func (s *Server) StartAPI(ctx context.Context, Addr string) error {
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
-	jwkURL := config.Getenv("JWKS_URL", "")
+	jwkURL := s.config.JwksURL()
 	if jwkURL != "" {
 		registerCtx, cancel := context.WithTimeout(ctx, jwkRegisterTimeout)
 		defer cancel()
@@ -629,6 +629,7 @@ func (s *Server) StartAPI(ctx context.Context, Addr string) error {
 
 	errCh := make(chan error, 1)
 	go func() {
+		log.Printf("Listening api on %s", httpServer.Addr)
 		errCh <- httpServer.ListenAndServe()
 	}()
 
@@ -697,18 +698,19 @@ func (s *Server) StartController(ctx context.Context, Addr string) error {
 
 	serveErr := make(chan error, 1)
 	go func() {
+		log.Printf("Listening controller on %s", s.config.ControllerAddr())
 		serveErr <- grpcServer.Serve(listener)
 	}()
 
 	select {
 	case <-ctx.Done():
 		grpcServer.GracefulStop()
-		err := <-serveErr
+		err = <-serveErr
 		if err != nil {
 			return err
 		}
 		return ctx.Err()
-	case err := <-serveErr:
+	case err = <-serveErr:
 		return err
 	}
 }
