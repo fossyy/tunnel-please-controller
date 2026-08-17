@@ -78,7 +78,7 @@ jobs:
           fi
 
       - name: Build and push Docker image (release)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
@@ -96,7 +96,7 @@ jobs:
         if: steps.version.outputs.IS_PRERELEASE == 'false'
 
       - name: Build and push Docker image (pre-release)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
