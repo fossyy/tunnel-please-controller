@@ -1,6 +1,6 @@
 module git.fossy.my.id/bagas/tunnel-please-controller
 
-go 1.26.0
+go 1.26.10
 
 require (
 	git.fossy.my.id/bagas/tunnel-please-grpc v1.5.0
@@ -8,7 +8,7 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/lestrrat-go/httprc/v3 v3.0.6
 	github.com/lestrrat-go/jwx/v3 v3.4.0
-	github.com/lestrrat-go/jwx/v4 v4.4.0
+	github.com/lestrrat-go/jwx/v4 v4.6.0
 	google.golang.org/grpc v1.85.0
 )
 

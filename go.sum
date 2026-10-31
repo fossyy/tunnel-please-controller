@@ -88,6 +88,7 @@ github.com/lestrrat-go/jwx/v3 v3.4.0/go.mod h1:jrZZIM3dgHB780ZrD/3H+ARR5ou4w3X3w
 github.com/lestrrat-go/jwx/v4 v4.2.0/go.mod h1:1V1wOmyFnMLltrTKXZSRMZ/GWq8UeMW1JmUaBNqD3E4=
 github.com/lestrrat-go/jwx/v4 v4.3.0/go.mod h1:F2H0OasEOACUjSKxiN/Nn+uQeKg/Tau3bXQksXTL/iA=
 github.com/lestrrat-go/jwx/v4 v4.4.0/go.mod h1:65utsGK/iSrjgGfu6iqj/TAvSfia6SSXkRpjHcKcTyg=
+github.com/lestrrat-go/jwx/v4 v4.6.0/go.mod h1:QOCcs9ZL83fD8Abq9mDXLrLT0ObfyINsISiW03PZPMs=
 github.com/lestrrat-go/option/v2 v2.0.0 h1:XxrcaJESE1fokHy3FpaQ/cXW8ZsIdWcdFzzLOcID3Ss=
 github.com/lestrrat-go/option/v2 v2.0.0/go.mod h1:oSySsmzMoR0iRzCDCaUfsCzxQHUEuhOViQObyy7S6Vg=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
