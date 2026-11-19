@@ -13,10 +13,8 @@ import (
 	"time"
 
 	"git.fossy.my.id/bagas/tunnel-please-controller/internal/config"
-	"git.fossy.my.id/bagas/tunnel-please-controller/internal/db/sqlc/repository"
 	proto "git.fossy.my.id/bagas/tunnel-please-grpc/gen"
 	"github.com/lestrrat-go/jwx/v3/jwk"
-	"github.com/lestrrat-go/jwx/v3/jwt"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health"
@@ -29,6 +27,13 @@ import (
 const (
 	defaultSubscriberResponseWait = 5 * time.Second
 	jwkRegisterTimeout            = 5 * time.Second
+	shutdownTimeout               = 10 * time.Second
+
+	errRequestBody     = "invalid request body"
+	errNoNode          = "no node found"
+	errSessionType     = "invalid session type specified"
+	errUnexpectedNode  = "received an unexpected response from the node"
+	errNoNodeSpecified = "no node specified"
 )
 
 type Subscriber struct {
@@ -39,27 +44,32 @@ type Subscriber struct {
 	mu        sync.Mutex
 }
 type Server struct {
-	Database    *repository.Queries
+	Database    authStore
 	Subscribers map[string]*Subscriber
 	mu          *sync.RWMutex
 	jwkCache    *jwk.Cache
 	config      config.Config
+	auth        config.OAuthConfig
+	httpClient  *http.Client
 	proto.UnimplementedEventServiceServer
 	proto.UnimplementedUserServiceServer
 }
 
-func New(database *repository.Queries, jwkCache *jwk.Cache, config config.Config) *Server {
+func New(database authStore, jwkCache *jwk.Cache, cfg config.Config) *Server {
+	auth, _ := cfg.(config.OAuthConfig)
 	return &Server{
 		Database:    database,
 		Subscribers: make(map[string]*Subscriber),
 		mu:          new(sync.RWMutex),
 		jwkCache:    jwkCache,
-		config:      config,
+		config:      cfg,
+		auth:        auth,
+		httpClient:  http.DefaultClient,
 	}
 }
 
 func (s *Server) Check(ctx context.Context, request *proto.CheckRequest) (*proto.CheckResponse, error) {
-	user, err := s.Database.GetVerifiedEmailBySSHIdentifier(ctx, request.GetAuthToken())
+	user, err := s.Database.GetVerifiedSSHIdentifier(ctx, request.GetAuthToken())
 	if err != nil || user == "" {
 		return &proto.CheckResponse{
 			Response: proto.AuthorizationResponse_MESSAGE_TYPE_UNAUTHORIZED,
@@ -258,69 +268,173 @@ func (s *Server) GetEventSubscriber(identity string) (*Subscriber, error) {
 	return req, nil
 }
 
-type SubscriberResult struct {
-	Identity string
-	Response *proto.Node
-	Err      error
-}
-
-func (s *Server) notifyAllSubscriber(ctx context.Context, recvChan <-chan *proto.Events, resultChan chan<- []SubscriberResult) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case controllerReq, ok := <-recvChan:
-			if !ok {
-				return
-			}
-			if controllerReq == nil {
-				continue
-			}
-
-			s.mu.RLock()
-			subs := make(map[string]*Subscriber, len(s.Subscribers))
-			for id, sub := range s.Subscribers {
-				subs[id] = sub
-			}
-			s.mu.RUnlock()
-			results := make([]SubscriberResult, 0, len(subs))
-			for id, sub := range subs {
-				select {
-				case <-ctx.Done():
-					return
-				case <-sub.done:
-					results = append(results, SubscriberResult{Identity: id, Err: status.Error(codes.Canceled, "subscriber removed")})
-					continue
-				case sub.events <- controllerReq:
-				default:
-					results = append(results, SubscriberResult{Identity: id, Err: status.Error(codes.Unavailable, "controller channel blocked")})
-					continue
-				}
-				select {
-				case <-ctx.Done():
-					return
-				case <-sub.done:
-					results = append(results, SubscriberResult{Identity: id, Err: status.Error(codes.Canceled, "subscriber removed")})
-				case resp, ok := <-sub.node:
-					if !ok {
-						results = append(results, SubscriberResult{Identity: id, Err: status.Error(codes.FailedPrecondition, "client channel closed")})
-						continue
-					}
-					results = append(results, SubscriberResult{Identity: id, Response: resp})
-				}
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case resultChan <- results:
-			}
-		}
-	}
-}
-
 type Slug struct {
 	Old string `json:"old"`
 	New string `json:"new"`
+}
+
+func writeError(writer http.ResponseWriter, responseStatus int, message string) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(responseStatus)
+	_ = json.NewEncoder(writer).Encode(map[string]string{"error": message})
+}
+
+func (s *Server) handlePatchSession(writer http.ResponseWriter, request *http.Request, user string) {
+	node := request.PathValue("node")
+	if node == "" {
+		writeError(writer, http.StatusBadRequest, errNoNodeSpecified)
+		return
+	}
+	var slug *Slug
+	if err := json.NewDecoder(request.Body).Decode(&slug); err != nil {
+		writeError(writer, http.StatusBadRequest, errRequestBody)
+		return
+	}
+	subscriber, err := s.GetEventSubscriber(node)
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, errNoNode)
+		return
+	}
+
+	subscriber.events <- &proto.Events{
+		Type: proto.EventType_SLUG_CHANGE,
+		Payload: &proto.Events_SlugEvent{
+			SlugEvent: &proto.SlugChangeEvent{
+				User: user,
+				Old:  slug.Old,
+				New:  slug.New,
+			},
+		},
+	}
+
+	select {
+	case response := <-subscriber.node:
+		if response == nil {
+			writeError(writer, http.StatusInternalServerError, errUnexpectedNode)
+			return
+		}
+		resp, ok := response.Payload.(*proto.Node_SlugEventResponse)
+		if !ok {
+			writeError(writer, http.StatusInternalServerError, errUnexpectedNode)
+			return
+		}
+		if !resp.SlugEventResponse.Success {
+			writeError(writer, http.StatusBadRequest, resp.SlugEventResponse.Message)
+			return
+		}
+		log.Printf("Received slug change response: %v", response)
+		writer.WriteHeader(http.StatusNoContent)
+	case <-request.Context().Done():
+	}
+}
+
+func (s *Server) handleDeleteSession(writer http.ResponseWriter, request *http.Request, user string) {
+	node := request.PathValue("node")
+	if node == "" {
+		writeError(writer, http.StatusBadRequest, errNoNodeSpecified)
+		return
+	}
+
+	sessionTypeRaw := request.PathValue("type")
+
+	var tunnelType proto.TunnelType
+	switch sessionTypeRaw {
+	case "http":
+		tunnelType = proto.TunnelType_HTTP
+	case "tcp":
+		tunnelType = proto.TunnelType_TCP
+	default:
+		writeError(writer, http.StatusBadRequest, errSessionType)
+		return
+	}
+
+	session := request.PathValue("session")
+
+	subscriber, err := s.GetEventSubscriber(node)
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, errNoNode)
+		return
+	}
+	subscriber.events <- &proto.Events{
+		Type: proto.EventType_TERMINATE_SESSION,
+		Payload: &proto.Events_TerminateSessionEvent{
+			TerminateSessionEvent: &proto.TerminateSessionEvent{
+				User:       user,
+				TunnelType: tunnelType,
+				Slug:       session,
+			},
+		},
+	}
+	select {
+	case response := <-subscriber.node:
+		if response == nil {
+			writeError(writer, http.StatusInternalServerError, errUnexpectedNode)
+			return
+		}
+		resp, ok := response.Payload.(*proto.Node_TerminateSessionEventResponse)
+		if !ok {
+			writeError(writer, http.StatusInternalServerError, errUnexpectedNode)
+			return
+		}
+		if !resp.TerminateSessionEventResponse.Success {
+			writeError(writer, http.StatusBadRequest, resp.TerminateSessionEventResponse.Message)
+			return
+		}
+		log.Printf("Received terminate session response: %v", response)
+		writer.WriteHeader(http.StatusNoContent)
+	case <-request.Context().Done():
+	}
+}
+
+func (s *Server) handleGetSessions(writer http.ResponseWriter, request *http.Request, user string) {
+	results := s.broadcastAndCollect(request.Context(), func(ctx context.Context, subscriber *Subscriber) (interface{}, bool) {
+		receive, err := s.sendAndReceive(ctx, subscriber, &proto.Events{
+			Type: proto.EventType_GET_SESSIONS,
+			Payload: &proto.Events_GetSessionsEvent{
+				GetSessionsEvent: &proto.GetSessionsEvent{
+					Identity: user,
+				},
+			},
+		}, defaultSubscriberResponseWait)
+		if err != nil {
+			log.Printf("get sessions request failed: %v", err)
+			return nil, false
+		}
+		if receive == nil {
+			log.Printf("get sessions request returned nil response")
+			return nil, false
+		}
+		payload, ok := receive.Payload.(*proto.Node_GetSessionsEvent)
+		if !ok || payload == nil || payload.GetSessionsEvent == nil {
+			log.Printf("unexpected get sessions payload type: %T", receive.Payload)
+			return nil, false
+		}
+		return payload.GetSessionsEvent.Details, true
+	})
+
+	flatten := flattenInterfaces(results)
+
+	writer.Header().Set("Content-Type", "application/json")
+
+	if len(flatten) == 0 {
+		_, err := writer.Write([]byte("[]"))
+		if err != nil {
+			log.Printf("write empty sessions response failed: %v", err)
+		}
+		return
+	}
+
+	marshal, err := json.Marshal(flatten)
+	if err != nil {
+		log.Printf("marshal sessions failed: %v", err)
+		writeError(writer, http.StatusInternalServerError, "failed to marshal sessions")
+		return
+	}
+	_, err = writer.Write(marshal)
+	if err != nil {
+		log.Printf("write sessions response failed: %v", err)
+		return
+	}
 }
 
 func (s *Server) StartAPI(ctx context.Context, Addr string) error {
@@ -332,300 +446,21 @@ func (s *Server) StartAPI(ctx context.Context, Addr string) error {
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
-	jwkURL := s.config.JwksURL()
-	if jwkURL != "" {
+	if s.oauthReady() {
 		registerCtx, cancel := context.WithTimeout(ctx, jwkRegisterTimeout)
 		defer cancel()
 
-		if err := s.jwkCache.Register(registerCtx, jwkURL); err != nil {
-			return fmt.Errorf("failed to register jwk cache: %w", err)
+		if err := s.jwkCache.Register(registerCtx, googleJWKSURL); err != nil {
+			return fmt.Errorf("failed to register google jwk cache: %w", err)
 		}
 	}
-	handler.HandleFunc("PATCH /api/session/{node}", func(writer http.ResponseWriter, request *http.Request) {
-		writeError := func(status int, msg string) {
-			writer.Header().Set("Content-Type", "application/json")
-			writer.WriteHeader(status)
-			_ = json.NewEncoder(writer).Encode(map[string]string{"error": msg})
-		}
-
-		var token jwt.Token
-		var err error
-		var keyset jwk.Set
-		if jwkURL != "" {
-			keyset, err = s.jwkCache.Lookup(request.Context(), jwkURL)
-			if err != nil {
-				log.Printf("jwks lookup failed: %v", err)
-				writeError(http.StatusBadGateway, "unable to fetch jwks")
-				return
-			}
-
-			token, err = jwt.ParseRequest(request, jwt.WithKeySet(keyset))
-			if err != nil {
-				log.Printf("jwt parse failed: %v", err)
-				writeError(http.StatusUnauthorized, "invalid or expired token")
-				return
-			}
-		} else {
-			token, err = jwt.ParseRequest(request, jwt.WithVerify(false))
-			if err != nil {
-				log.Printf("jwt parse failed (no verification): %v", err)
-				writeError(http.StatusBadRequest, "invalid token")
-				return
-			}
-		}
-
-		var email string
-		err = token.Get("email", &email)
-		if err != nil {
-			log.Printf("email claim not found: %v", err)
-			writeError(http.StatusBadRequest, "missing email claim in token")
-			return
-		}
-		if email == "" {
-			writeError(http.StatusBadRequest, "empty email claim in token")
-			return
-		}
-		node := request.PathValue("node")
-		if node == "" {
-			writeError(http.StatusBadRequest, "no node specified")
-			return
-		}
-		var slug *Slug
-		if err := json.NewDecoder(request.Body).Decode(&slug); err != nil {
-			writeError(http.StatusBadRequest, "invalid request body")
-			return
-		}
-		subscriber, err := s.GetEventSubscriber(node)
-		if err != nil {
-			writeError(http.StatusBadRequest, "no node found")
-			return
-		}
-
-		subscriber.events <- &proto.Events{
-			Type: proto.EventType_SLUG_CHANGE,
-			Payload: &proto.Events_SlugEvent{
-				SlugEvent: &proto.SlugChangeEvent{
-					User: email,
-					Old:  slug.Old,
-					New:  slug.New,
-				},
-			},
-		}
-
-		select {
-		case response := <-subscriber.node:
-			resp, ok := response.Payload.(*proto.Node_SlugEventResponse)
-			if !ok {
-				writeError(http.StatusInternalServerError, "received an unexpected response from the node")
-				return
-			}
-			if !resp.SlugEventResponse.Success {
-				writeError(http.StatusBadRequest, resp.SlugEventResponse.Message)
-				return
-			}
-			log.Printf("Received slug change response: %v", response)
-			writer.WriteHeader(http.StatusNoContent)
-		case <-request.Context().Done():
-		}
-	})
-
-	handler.HandleFunc("DELETE /api/session/{node}/{type}/{session}", func(writer http.ResponseWriter, request *http.Request) {
-		writeError := func(status int, msg string) {
-			writer.Header().Set("Content-Type", "application/json")
-			writer.WriteHeader(status)
-			_ = json.NewEncoder(writer).Encode(map[string]string{"error": msg})
-		}
-
-		var token jwt.Token
-		var err error
-		var keyset jwk.Set
-		if jwkURL != "" {
-			keyset, err = s.jwkCache.Lookup(request.Context(), jwkURL)
-			if err != nil {
-				log.Printf("jwks lookup failed: %v", err)
-				writeError(http.StatusBadGateway, "unable to fetch jwks")
-				return
-			}
-
-			token, err = jwt.ParseRequest(request, jwt.WithKeySet(keyset))
-			if err != nil {
-				log.Printf("jwt parse failed: %v", err)
-				writeError(http.StatusUnauthorized, "invalid or expired token")
-				return
-			}
-		} else {
-			token, err = jwt.ParseRequest(request, jwt.WithVerify(false))
-			if err != nil {
-				log.Printf("jwt parse failed (no verification): %v", err)
-				writeError(http.StatusBadRequest, "invalid token")
-				return
-			}
-		}
-
-		var email string
-		err = token.Get("email", &email)
-		if err != nil {
-			log.Printf("email claim not found: %v", err)
-			writeError(http.StatusBadRequest, "missing email claim in token")
-			return
-		}
-		if email == "" {
-			writeError(http.StatusBadRequest, "empty email claim in token")
-			return
-		}
-		node := request.PathValue("node")
-		if node == "" {
-			writeError(http.StatusBadRequest, "no node specified")
-			return
-		}
-
-		sessionTypeRaw := request.PathValue("type")
-		if node == "" {
-			writeError(http.StatusBadRequest, "no type specified")
-			return
-		}
-
-		var tunnelType proto.TunnelType
-		if sessionTypeRaw == "http" {
-			tunnelType = proto.TunnelType_HTTP
-		} else if sessionTypeRaw == "tcp" {
-			tunnelType = proto.TunnelType_TCP
-		} else {
-			writeError(http.StatusBadRequest, "invalid session type specified")
-			return
-		}
-
-		session := request.PathValue("session")
-		if node == "" {
-			writeError(http.StatusBadRequest, "no node specified")
-			return
-		}
-
-		subscriber, err := s.GetEventSubscriber(node)
-		if err != nil {
-			writeError(http.StatusBadRequest, "no node found")
-			return
-		}
-		subscriber.events <- &proto.Events{
-			Type: proto.EventType_TERMINATE_SESSION,
-			Payload: &proto.Events_TerminateSessionEvent{
-				TerminateSessionEvent: &proto.TerminateSessionEvent{
-					User:       email,
-					TunnelType: tunnelType,
-					Slug:       session,
-				},
-			},
-		}
-		select {
-		case response := <-subscriber.node:
-			resp, ok := response.Payload.(*proto.Node_TerminateSessionEventResponse)
-			if !ok {
-				writeError(http.StatusInternalServerError, "received an unexpected response from the node")
-				return
-			}
-			if !resp.TerminateSessionEventResponse.Success {
-				writeError(http.StatusBadRequest, resp.TerminateSessionEventResponse.Message)
-				return
-			}
-			log.Printf("Received terminate session response: %v", response)
-			writer.WriteHeader(http.StatusNoContent)
-		case <-request.Context().Done():
-		}
-	})
-
-	handler.HandleFunc("/api/sessions", func(writer http.ResponseWriter, request *http.Request) {
-		writeError := func(status int, msg string) {
-			writer.Header().Set("Content-Type", "application/json")
-			writer.WriteHeader(status)
-			_ = json.NewEncoder(writer).Encode(map[string]string{"error": msg})
-		}
-
-		var token jwt.Token
-		var err error
-		if jwkURL != "" {
-			keyset, err := s.jwkCache.Lookup(request.Context(), jwkURL)
-			if err != nil {
-				log.Printf("jwks lookup failed: %v", err)
-				writeError(http.StatusBadGateway, "unable to fetch jwks")
-				return
-			}
-
-			token, err = jwt.ParseRequest(request, jwt.WithKeySet(keyset))
-			if err != nil {
-				log.Printf("jwt parse failed: %v", err)
-				writeError(http.StatusUnauthorized, "invalid or expired token")
-				return
-			}
-		} else {
-			token, err = jwt.ParseRequest(request, jwt.WithVerify(false))
-			if err != nil {
-				log.Printf("jwt parse failed (no verification): %v", err)
-				writeError(http.StatusBadRequest, "invalid token")
-				return
-			}
-		}
-
-		var email string
-		err = token.Get("email", &email)
-		if err != nil {
-			log.Printf("email claim not found: %v", err)
-			writeError(http.StatusBadRequest, "missing email claim in token")
-			return
-		}
-		if email == "" {
-			writeError(http.StatusBadRequest, "empty email claim in token")
-			return
-		}
-
-		results := s.broadcastAndCollect(request.Context(), func(ctx context.Context, subscriber *Subscriber) (interface{}, bool) {
-			receive, err := s.sendAndReceive(ctx, subscriber, &proto.Events{
-				Type: proto.EventType_GET_SESSIONS,
-				Payload: &proto.Events_GetSessionsEvent{
-					GetSessionsEvent: &proto.GetSessionsEvent{
-						Identity: email,
-					},
-				},
-			}, defaultSubscriberResponseWait)
-			if err != nil {
-				log.Printf("get sessions request failed: %v", err)
-				return nil, false
-			}
-			if receive == nil {
-				log.Printf("get sessions request returned nil response")
-				return nil, false
-			}
-			payload, ok := receive.Payload.(*proto.Node_GetSessionsEvent)
-			if !ok || payload == nil || payload.GetSessionsEvent == nil {
-				log.Printf("unexpected get sessions payload type: %T", receive.Payload)
-				return nil, false
-			}
-			return payload.GetSessionsEvent.Details, true
-		})
-
-		flatten := flattenInterfaces(results)
-
-		writer.Header().Set("Content-Type", "application/json")
-
-		if len(flatten) == 0 {
-			_, err := writer.Write([]byte("[]"))
-			if err != nil {
-				log.Printf("write empty sessions response failed: %v", err)
-			}
-			return
-		}
-
-		marshal, err := json.Marshal(flatten)
-		if err != nil {
-			log.Printf("marshal sessions failed: %v", err)
-			writeError(http.StatusInternalServerError, "failed to marshal sessions")
-			return
-		}
-		_, err = writer.Write(marshal)
-		if err != nil {
-			log.Printf("write sessions response failed: %v", err)
-			return
-		}
-	})
+	handler.HandleFunc("GET /api/auth/login", s.handleLogin)
+	handler.HandleFunc("GET /api/auth/callback", s.handleCallback)
+	handler.HandleFunc("POST /api/auth/refresh", s.handleRefresh)
+	handler.HandleFunc("POST /api/auth/logout", s.handleLogout)
+	handler.HandleFunc("PATCH /api/session/{node}", s.withAuth(s.handlePatchSession))
+	handler.HandleFunc("DELETE /api/session/{node}/{type}/{session}", s.withAuth(s.handleDeleteSession))
+	handler.HandleFunc("/api/sessions", s.withAuth(s.handleGetSessions))
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -635,7 +470,7 @@ func (s *Server) StartAPI(ctx context.Context, Addr string) error {
 
 	select {
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		_ = httpServer.Shutdown(shutdownCtx)
 		return ctx.Err()
@@ -704,7 +539,17 @@ func (s *Server) StartController(ctx context.Context, Addr string) error {
 
 	select {
 	case <-ctx.Done():
-		grpcServer.GracefulStop()
+		stopped := make(chan struct{})
+		go func() {
+			grpcServer.GracefulStop()
+			close(stopped)
+		}()
+		select {
+		case <-stopped:
+		case <-time.After(shutdownTimeout):
+			grpcServer.Stop()
+			<-stopped
+		}
 		err = <-serveErr
 		if err != nil {
 			return err

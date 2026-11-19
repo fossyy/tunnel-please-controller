@@ -7,12 +7,13 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"git.fossy.my.id/bagas/tunnel-please-controller/internal/config"
 	"git.fossy.my.id/bagas/tunnel-please-controller/internal/db/sqlc/repository"
 	"git.fossy.my.id/bagas/tunnel-please-controller/internal/server"
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lestrrat-go/httprc/v3"
 	"github.com/lestrrat-go/jwx/v3/jwk"
 )
@@ -28,12 +29,10 @@ type Bootstrap interface {
 }
 
 func New(config config.Config) Bootstrap {
-	errChan := make(chan error, 5)
-	signalChan := make(chan os.Signal, 1)
 	return &bootstrap{
 		config:     config,
-		errChan:    errChan,
-		signalChan: signalChan,
+		errChan:    make(chan error, 2),
+		signalChan: make(chan os.Signal, 1),
 	}
 }
 
@@ -42,9 +41,9 @@ func (b *bootstrap) Run() error {
 	defer cancel()
 
 	signal.Notify(b.signalChan, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(b.signalChan)
 
-	dbURL := b.config.DatabaseURL()
-	repo, err := startDatabase(ctx, dbURL)
+	repo, pool, err := startDatabase(ctx, b.config.DatabaseURL())
 	if err != nil {
 		return err
 	}
@@ -52,46 +51,46 @@ func (b *bootstrap) Run() error {
 	client := httprc.NewClient()
 	jwkCache, err := jwk.NewCache(ctx, client)
 	if err != nil {
+		pool.Close()
 		return err
 	}
 	s := server.New(repo, jwkCache, b.config)
 
-	b.errChan = make(chan error, 2)
-
-	go func() {
-		if err = s.StartAPI(ctx, b.config.ApiAddr()); err != nil && !errors.Is(err, context.Canceled) {
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		if err := s.StartAPI(ctx, b.config.ApiAddr()); err != nil && !errors.Is(err, context.Canceled) {
 			b.errChan <- err
 		}
-	}()
-
-	go func() {
-		if err = s.StartController(ctx, b.config.ControllerAddr()); err != nil && !errors.Is(err, context.Canceled) {
+	})
+	wg.Go(func() {
+		if err := s.StartController(ctx, b.config.ControllerAddr()); err != nil && !errors.Is(err, context.Canceled) {
 			b.errChan <- err
 		}
-	}()
+	})
 
 	select {
-	case err = <-b.errChan:
+	case err := <-b.errChan:
+		cancel()
+		wg.Wait()
+		pool.Close()
 		return fmt.Errorf("service error: %w", err)
 	case sig := <-b.signalChan:
 		log.Printf("Received signal %s, initiating graceful shutdown", sig)
 		cancel()
+		wg.Wait()
+		pool.Close()
 		return nil
 	}
 }
 
-func startDatabase(ctx context.Context, dbURL string) (*repository.Queries, error) {
-	connect, err := pgx.Connect(ctx, dbURL)
+func startDatabase(ctx context.Context, dbURL string) (*repository.Queries, *pgxpool.Pool, error) {
+	pool, err := pgxpool.New(ctx, dbURL)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-
-	defer func(connect *pgx.Conn, ctx context.Context) {
-		err = connect.Close(ctx)
-		if err != nil {
-			panic(err)
-		}
-	}(connect, ctx)
-
-	return repository.New(connect), nil
+	if err = pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, nil, err
+	}
+	return repository.New(pool), pool, nil
 }
