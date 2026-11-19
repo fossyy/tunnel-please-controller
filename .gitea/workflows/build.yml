@@ -14,11 +14,9 @@ jobs:
       postgres:
         image: postgres:16
         env:
-          POSTGRES_USER: tp
-          POSTGRES_PASSWORD: tp
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: tp_test
           POSTGRES_DB: tp_test
-        ports:
-          - 5432:5432
         options: >-
           --health-cmd pg_isready
           --health-interval 5s
@@ -48,7 +46,7 @@ jobs:
         run: |
           for f in internal/db/sqlc/migrations/*.up.sql; do
             echo "applying $f"
-            PGPASSWORD=tp psql -h 127.0.0.1 -U tp -d tp_test -v ON_ERROR_STOP=1 -f "$f"
+            PGPASSWORD=tp_test psql -h postgres -U postgres -d tp_test -v ON_ERROR_STOP=1 -f "$f"
           done
 
       - name: Run go vet
@@ -56,7 +54,7 @@ jobs:
 
       - name: Run tests
         env:
-          TP_TEST_DATABASE_URL: postgres://tp:tp@127.0.0.1:5432/tp_test
+          TP_TEST_DATABASE_URL: postgres://postgres:tp_test@postgres:5432/tp_test
         run: go test -v -p 4 ./...
 
   build-and-push:
