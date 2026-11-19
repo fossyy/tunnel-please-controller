@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"git.fossy.my.id/bagas/tunnel-please-controller/internal/db/sqlc/repository"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/lestrrat-go/jwx/v3/jwa"
 	"github.com/lestrrat-go/jwx/v3/jwt"
@@ -40,6 +41,8 @@ const (
 	oauthFailureReason   = "login_failed"
 	oauthStateCookiePath = "/api/auth/"
 
+	refreshCleanupBatch = 100
+
 	errInvalidToken        = "invalid or expired token"
 	errInvalidRefreshToken = "invalid refresh token"
 	errAuthUnavailable     = "authentication is not configured"
@@ -57,6 +60,7 @@ type authStore interface {
 	GetRefreshTokenByHash(ctx context.Context, tokenHash string) (repository.GetRefreshTokenByHashRow, error)
 	RotateRefreshToken(ctx context.Context, arg repository.RotateRefreshTokenParams) (repository.RotateRefreshTokenRow, error)
 	RevokeRefreshTokenFamily(ctx context.Context, familyID string) error
+	DeleteExpiredRefreshTokens(ctx context.Context, maxRows int32) (int64, error)
 }
 
 type userHandler func(http.ResponseWriter, *http.Request, string)
@@ -187,7 +191,7 @@ func (s *Server) sameOrigin(request *http.Request) bool {
 	if err != nil {
 		return false
 	}
-	allowed, err := url.Parse(s.auth.GoogleRedirectURL())
+	allowed, err := url.Parse(s.auth.FrontendURL())
 	if err != nil {
 		return false
 	}
@@ -515,6 +519,9 @@ func (s *Server) upsertGoogleUser(ctx context.Context, claims *googleIDClaims) (
 		GoogleSubject: claims.subject,
 	})
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", "", errors.New("canonical ssh identifier unavailable: subject held by another user")
+		}
 		return "", "", fmt.Errorf("upsert google user: %w", err)
 	}
 	return row.SshIdentifier, row.UserID, nil
@@ -538,12 +545,19 @@ func (s *Server) startRefreshFamily(ctx context.Context, userID string) (string,
 		UserID:    userID,
 		FamilyID:  familyID,
 		TokenHash: hashToken(refreshToken),
-		ExpiresAt: pgtype.Timestamp{Time: time.Now().Add(s.auth.RefreshTokenTTL()), Valid: true},
+		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(s.auth.RefreshTokenTTL()), Valid: true},
 	})
 	if err != nil {
 		return "", fmt.Errorf("create refresh token: %w", err)
 	}
+	s.cleanupExpiredRefreshTokens(ctx)
 	return refreshToken, nil
+}
+
+func (s *Server) cleanupExpiredRefreshTokens(ctx context.Context) {
+	if _, err := s.Database.DeleteExpiredRefreshTokens(ctx, refreshCleanupBatch); err != nil {
+		log.Printf("delete expired refresh tokens failed: %v", err)
+	}
 }
 
 func (s *Server) handleRefresh(writer http.ResponseWriter, request *http.Request) {
@@ -575,20 +589,20 @@ func (s *Server) handleRefresh(writer http.ResponseWriter, request *http.Request
 		LookupHash:   tokenHash,
 		NewID:        tokenID,
 		NewTokenHash: hashToken(refreshToken),
-		NewExpiresAt: pgtype.Timestamp{Time: time.Now().Add(s.auth.RefreshTokenTTL()), Valid: true},
+		NewExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(s.auth.RefreshTokenTTL()), Valid: true},
 	})
 	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			log.Printf("rotate refresh token failed: %v", err)
+			writeError(writer, http.StatusServiceUnavailable, errRefreshFailed)
+			return
+		}
 		s.rejectRefreshToken(request.Context(), tokenHash)
 		writeError(writer, http.StatusUnauthorized, errInvalidRefreshToken)
 		return
 	}
-	identity, err := s.Database.GetUserIdentity(request.Context(), rotated.UserID)
-	if err != nil {
-		log.Printf("load user for refresh failed: %v", err)
-		writeError(writer, http.StatusInternalServerError, errRefreshFailed)
-		return
-	}
-	sessionToken, err := s.signSessionToken(identity.SshIdentifier, identity.Email)
+	s.cleanupExpiredRefreshTokens(request.Context())
+	sessionToken, err := s.signSessionToken(rotated.SshIdentifier, rotated.Email)
 	if err != nil {
 		log.Printf("sign session token failed: %v", err)
 		writeError(writer, http.StatusInternalServerError, errRefreshFailed)

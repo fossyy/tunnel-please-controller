@@ -37,10 +37,10 @@ type RefreshToken struct {
 	UserID    string
 	FamilyID  string
 	TokenHash string
-	ExpiresAt pgtype.Timestamp
-	CreatedAt pgtype.Timestamp
-	RotatedAt pgtype.Timestamp
-	RevokedAt pgtype.Timestamp
+	ExpiresAt pgtype.Timestamptz
+	CreatedAt pgtype.Timestamptz
+	RotatedAt pgtype.Timestamptz
+	RevokedAt pgtype.Timestamptz
 }
 
 type Session struct {

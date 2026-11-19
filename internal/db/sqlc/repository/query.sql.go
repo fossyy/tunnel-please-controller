@@ -21,7 +21,7 @@ type CreateRefreshTokenParams struct {
 	UserID    string
 	FamilyID  string
 	TokenHash string
-	ExpiresAt pgtype.Timestamp
+	ExpiresAt pgtype.Timestamptz
 }
 
 func (q *Queries) CreateRefreshToken(ctx context.Context, arg CreateRefreshTokenParams) error {
@@ -35,6 +35,23 @@ func (q *Queries) CreateRefreshToken(ctx context.Context, arg CreateRefreshToken
 	return err
 }
 
+const deleteExpiredRefreshTokens = `-- name: DeleteExpiredRefreshTokens :execrows
+DELETE FROM public.refresh_token
+WHERE id IN (
+    SELECT id FROM public.refresh_token
+    WHERE expires_at < now()
+    LIMIT $1
+)
+`
+
+func (q *Queries) DeleteExpiredRefreshTokens(ctx context.Context, maxRows int32) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteExpiredRefreshTokens, maxRows)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getRefreshTokenByHash = `-- name: GetRefreshTokenByHash :one
 SELECT id, user_id, family_id, expires_at, rotated_at, revoked_at
 FROM public.refresh_token
@@ -45,9 +62,9 @@ type GetRefreshTokenByHashRow struct {
 	ID        string
 	UserID    string
 	FamilyID  string
-	ExpiresAt pgtype.Timestamp
-	RotatedAt pgtype.Timestamp
-	RevokedAt pgtype.Timestamp
+	ExpiresAt pgtype.Timestamptz
+	RotatedAt pgtype.Timestamptz
+	RevokedAt pgtype.Timestamptz
 }
 
 func (q *Queries) GetRefreshTokenByHash(ctx context.Context, tokenHash string) (GetRefreshTokenByHashRow, error) {
@@ -113,11 +130,13 @@ const rotateRefreshToken = `-- name: RotateRefreshToken :one
 WITH rotated AS (
     UPDATE public.refresh_token rt
     SET rotated_at = now()
+    FROM public."user" u
     WHERE rt.token_hash = $1
       AND rt.rotated_at IS NULL
       AND rt.revoked_at IS NULL
       AND rt.expires_at > now()
-    RETURNING rt.user_id, rt.family_id
+      AND u.id = rt.user_id
+    RETURNING rt.user_id, rt.family_id, u.ssh_identifier, u.email
 ),
 replaced AS (
     INSERT INTO public.refresh_token (id, user_id, family_id, token_hash, expires_at)
@@ -125,20 +144,23 @@ replaced AS (
     FROM rotated
     RETURNING user_id, family_id
 )
-SELECT user_id, family_id
-FROM replaced
+SELECT r.user_id, r.family_id, r.ssh_identifier, r.email
+FROM replaced p
+JOIN rotated r USING (user_id, family_id)
 `
 
 type RotateRefreshTokenParams struct {
 	LookupHash   string
 	NewID        string
 	NewTokenHash string
-	NewExpiresAt pgtype.Timestamp
+	NewExpiresAt pgtype.Timestamptz
 }
 
 type RotateRefreshTokenRow struct {
-	UserID   string
-	FamilyID string
+	UserID        string
+	FamilyID      string
+	SshIdentifier string
+	Email         string
 }
 
 func (q *Queries) RotateRefreshToken(ctx context.Context, arg RotateRefreshTokenParams) (RotateRefreshTokenRow, error) {
@@ -149,7 +171,12 @@ func (q *Queries) RotateRefreshToken(ctx context.Context, arg RotateRefreshToken
 		arg.NewExpiresAt,
 	)
 	var i RotateRefreshTokenRow
-	err := row.Scan(&i.UserID, &i.FamilyID)
+	err := row.Scan(
+		&i.UserID,
+		&i.FamilyID,
+		&i.SshIdentifier,
+		&i.Email,
+	)
 	return i, err
 }
 
@@ -176,10 +203,15 @@ created AS (
     INSERT INTO public."user" (id, ssh_identifier, name, email, email_verified, image)
     SELECT $3, $1, $4, $2, true, $5
     WHERE NOT EXISTS (SELECT 1 FROM matched)
+      AND NOT EXISTS (
+          SELECT 1 FROM public."user" holder
+          WHERE holder.ssh_identifier = $1
+            AND holder.id <> $3
+      )
     ON CONFLICT (email) DO UPDATE
         SET email_verified = true,
             updated_at = now()
-    RETURNING id
+    RETURNING id, ssh_identifier
 ),
 resolved AS (
     SELECT id FROM matched
@@ -187,22 +219,32 @@ resolved AS (
     SELECT id FROM created
 ),
 canonicalized AS (
-    UPDATE public."user"
+    UPDATE public."user" u
     SET ssh_identifier = $1,
         updated_at = now()
-    WHERE id IN (SELECT id FROM resolved)
-      AND ssh_identifier <> $1
-    RETURNING id
+    WHERE u.id IN (SELECT id FROM resolved)
+      AND u.ssh_identifier <> $1
+      AND NOT EXISTS (
+          SELECT 1 FROM public."user" holder
+          WHERE holder.ssh_identifier = $1
+            AND holder.id <> u.id
+      )
+    RETURNING u.id, u.ssh_identifier
 ),
-canonicalized_ids AS (
-    SELECT id FROM canonicalized
+canonical AS (
+    SELECT id, ssh_identifier FROM created
     UNION
-    SELECT id FROM resolved
+    SELECT id, ssh_identifier FROM canonicalized
+    UNION
+    SELECT r.id, u.ssh_identifier
+    FROM resolved r
+    JOIN public."user" u ON u.id = r.id
+    WHERE u.ssh_identifier = $1
 ),
 accounted AS (
     INSERT INTO public.account (id, account_id, provider_id, user_id, updated_at)
-    SELECT $6, $1, 'google', r.id, now()
-    FROM resolved r
+    SELECT $6, $1, 'google', c.id, now()
+    FROM canonical c
     ON CONFLICT (provider_id, account_id) DO NOTHING
     RETURNING user_id
 ),
@@ -212,10 +254,10 @@ refreshed AS (
         image = COALESCE($5, image),
         email_verified = true,
         updated_at = now()
-    WHERE id IN (SELECT id FROM canonicalized_ids)
+    WHERE id IN (SELECT id FROM canonical)
 )
-SELECT r.id AS user_id, CAST($1 AS text) AS ssh_identifier
-FROM resolved r
+SELECT c.id AS user_id, c.ssh_identifier
+FROM canonical c
 `
 
 type UpsertGoogleUserParams struct {

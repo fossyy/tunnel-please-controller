@@ -24,3 +24,11 @@ sql:
               type: "*time.Time"
               pointer: true
             nullable: true
+          - column: "public.refresh_token.rotated_at"
+            go_type:
+              import: "github.com/jackc/pgx/v5/pgtype"
+              type: "Timestamptz"
+          - column: "public.refresh_token.revoked_at"
+            go_type:
+              import: "github.com/jackc/pgx/v5/pgtype"
+              type: "Timestamptz"
