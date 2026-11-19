@@ -13,6 +13,7 @@ import (
 	"git.fossy.my.id/bagas/tunnel-please-controller/internal/config"
 	"git.fossy.my.id/bagas/tunnel-please-controller/internal/db/sqlc/repository"
 	"git.fossy.my.id/bagas/tunnel-please-controller/internal/server"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lestrrat-go/httprc/v3"
 	"github.com/lestrrat-go/jwx/v3/jwk"
@@ -92,5 +93,36 @@ func startDatabase(ctx context.Context, dbURL string) (*repository.Queries, *pgx
 		pool.Close()
 		return nil, nil, err
 	}
+	if err = checkSchema(ctx, pool); err != nil {
+		pool.Close()
+		return nil, nil, err
+	}
 	return repository.New(pool), pool, nil
+}
+
+var requiredTables = []string{"user", "account", "refresh_token"}
+var requiredIndexes = []string{"account_provider_account_unique", "refresh_token_hash_unique"}
+
+func checkSchema(ctx context.Context, pool *pgxpool.Pool) error {
+	for _, table := range requiredTables {
+		identifier := "public." + pgx.Identifier{table}.Sanitize()
+		var exists bool
+		if err := pool.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", identifier).Scan(&exists); err != nil {
+			return fmt.Errorf("schema check: %w", err)
+		}
+		if !exists {
+			return fmt.Errorf("schema check: table %s is missing; apply the migrations in internal/db/sqlc/migrations with your migration tool before starting", identifier)
+		}
+	}
+	for _, index := range requiredIndexes {
+		identifier := "public." + pgx.Identifier{index}.Sanitize()
+		var exists bool
+		if err := pool.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", identifier).Scan(&exists); err != nil {
+			return fmt.Errorf("schema check: %w", err)
+		}
+		if !exists {
+			return fmt.Errorf("schema check: index %s is missing; apply the migrations in internal/db/sqlc/migrations with your migration tool before starting", identifier)
+		}
+	}
+	return nil
 }

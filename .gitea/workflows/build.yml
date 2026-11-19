@@ -10,6 +10,21 @@ jobs:
     name: Run Tests
     runs-on: ubuntu-latest
 
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: tp
+          POSTGRES_PASSWORD: tp
+          POSTGRES_DB: tp_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -23,10 +38,25 @@ jobs:
       - name: Install dependencies
         run: go mod download
 
+      - name: Install psql
+        run: |
+          if ! command -v psql >/dev/null; then
+            sudo apt-get update && sudo apt-get install -y postgresql-client
+          fi
+
+      - name: Apply database migrations
+        run: |
+          for f in internal/db/sqlc/migrations/*.up.sql; do
+            echo "applying $f"
+            PGPASSWORD=tp psql -h 127.0.0.1 -U tp -d tp_test -v ON_ERROR_STOP=1 -f "$f"
+          done
+
       - name: Run go vet
         run: go vet ./...
 
       - name: Run tests
+        env:
+          TP_TEST_DATABASE_URL: postgres://tp:tp@127.0.0.1:5432/tp_test
         run: go test -v -p 4 ./...
 
   build-and-push:
