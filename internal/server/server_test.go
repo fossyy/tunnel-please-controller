@@ -16,6 +16,7 @@ import (
 
 	"git.fossy.my.id/bagas/tunnel-please-controller/internal/config"
 	proto "git.fossy.my.id/bagas/tunnel-please-grpc/gen"
+	"github.com/jackc/pgx/v5"
 	"github.com/lestrrat-go/httprc/v3"
 	"github.com/lestrrat-go/jwx/v3/jwa"
 	"github.com/lestrrat-go/jwx/v3/jwk"
@@ -607,3 +608,165 @@ func TestOAuthNotReady(t *testing.T) {
 }
 
 var _ config.Config = fakeConfig{}
+
+type fakeAuthStore struct {
+	authStore
+	identifier string
+	err        error
+}
+
+func (f fakeAuthStore) GetVerifiedSSHIdentifier(context.Context, string) (string, error) {
+	return f.identifier, f.err
+}
+
+func TestCheckUserContract(t *testing.T) {
+	tests := []struct {
+		name         string
+		store        fakeAuthStore
+		wantResponse proto.AuthorizationResponse
+		wantUser     string
+		wantErr      bool
+	}{
+		{
+			name:         "unknown user returns unauthorized without error",
+			store:        fakeAuthStore{err: pgx.ErrNoRows},
+			wantResponse: proto.AuthorizationResponse_MESSAGE_TYPE_UNAUTHORIZED,
+		},
+		{
+			name:         "empty identifier returns unauthorized without error",
+			store:        fakeAuthStore{},
+			wantResponse: proto.AuthorizationResponse_MESSAGE_TYPE_UNAUTHORIZED,
+		},
+		{
+			name:         "verified user returns authorized",
+			store:        fakeAuthStore{identifier: "google-sub-1"},
+			wantResponse: proto.AuthorizationResponse_MESSAGE_TYPE_AUTHORIZED,
+			wantUser:     "google-sub-1",
+		},
+		{
+			name:    "database error returns error",
+			store:   fakeAuthStore{err: errors.New("connection refused")},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := New(tt.store, nil, fakeConfig{})
+			response, err := srv.Check(context.Background(), &proto.CheckRequest{AuthToken: "identity"})
+			if tt.wantErr != (err != nil) {
+				t.Fatalf("Check() error = %v, wantErr %t", err, tt.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if response.GetResponse() != tt.wantResponse {
+				t.Errorf("response = %v, want %v", response.GetResponse(), tt.wantResponse)
+			}
+			if response.GetUser() != tt.wantUser {
+				t.Errorf("user = %q, want %q", response.GetUser(), tt.wantUser)
+			}
+		})
+	}
+}
+
+func TestPatchSessionNullBody(t *testing.T) {
+	srv, baseURL, stop := startTestAPI(t)
+	defer stop()
+
+	token := sessionCookieValue(t, srv)
+	for _, body := range []string{"null", "", `{"old":"","new":"b"}`, `{"old":"a"}`} {
+		resp, decoded := doJSON(t, baseURL, http.MethodPatch, "/api/session/node1", token, body)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("body %q: status = %d, want %d", body, resp.StatusCode, http.StatusBadRequest)
+		}
+		if decoded["error"] != errRequestBody {
+			t.Errorf("body %q: error = %q, want %q", body, decoded["error"], errRequestBody)
+		}
+	}
+}
+
+func TestPatchSessionNodeTimeout(t *testing.T) {
+	srv, baseURL, stop := startTestAPI(t)
+	defer stop()
+
+	addSilentSubscriber(t, srv, "node-silent")
+
+	resp, decoded := doJSON(t, baseURL, http.MethodPatch, "/api/session/node-silent", sessionCookieValue(t, srv), `{"old":"a","new":"b"}`)
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusGatewayTimeout)
+	}
+	if decoded["error"] != errNodeTimeout {
+		t.Errorf("error = %q, want %q", decoded["error"], errNodeTimeout)
+	}
+}
+
+func TestPatchSessionConcurrentRequests(t *testing.T) {
+	srv, baseURL, stop := startTestAPI(t)
+	defer stop()
+
+	addTestSubscriber(t, srv, "node-busy", func(*proto.Events) *proto.Node {
+		return slugResponse(true, "")
+	})
+
+	token := sessionCookieValue(t, srv)
+	statuses := make(chan int, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			req, err := http.NewRequest(http.MethodPatch, baseURL+"/api/session/node-busy", strings.NewReader(`{"old":"a","new":"b"}`))
+			if err != nil {
+				statuses <- -1
+				return
+			}
+			req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				statuses <- -1
+				return
+			}
+			_ = resp.Body.Close()
+			statuses <- resp.StatusCode
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		if got := <-statuses; got != http.StatusNoContent {
+			t.Errorf("concurrent patch status = %d, want %d", got, http.StatusNoContent)
+		}
+	}
+}
+
+func TestSessionsRejectsNonGet(t *testing.T) {
+	srv, baseURL, stop := startTestAPI(t)
+	defer stop()
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/api/sessions", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sessionCookieValue(t, srv)})
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+func addSilentSubscriber(t *testing.T, srv *Server, identity string) {
+	t.Helper()
+
+	sub := &Subscriber{
+		node:   make(chan *proto.Node, 1),
+		events: make(chan *proto.Events, 10),
+		done:   make(chan struct{}),
+	}
+	if err := srv.AddEventSubscriber(identity, sub); err != nil {
+		t.Fatalf("add subscriber: %v", err)
+	}
+	t.Cleanup(func() { srv.RemoveEventSubscriber(identity) })
+	go func() {
+		for range sub.events {
+		}
+	}()
+}

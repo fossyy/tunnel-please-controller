@@ -14,6 +14,7 @@ import (
 
 	"git.fossy.my.id/bagas/tunnel-please-controller/internal/config"
 	proto "git.fossy.my.id/bagas/tunnel-please-grpc/gen"
+	"github.com/jackc/pgx/v5"
 	"github.com/lestrrat-go/jwx/v3/jwk"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -34,6 +35,7 @@ const (
 	errSessionType     = "invalid session type specified"
 	errUnexpectedNode  = "received an unexpected response from the node"
 	errNoNodeSpecified = "no node specified"
+	errNodeTimeout     = "node response timeout"
 )
 
 type Subscriber struct {
@@ -70,11 +72,14 @@ func New(database authStore, jwkCache *jwk.Cache, cfg config.Config) *Server {
 
 func (s *Server) Check(ctx context.Context, request *proto.CheckRequest) (*proto.CheckResponse, error) {
 	user, err := s.Database.GetVerifiedSSHIdentifier(ctx, request.GetAuthToken())
-	if err != nil || user == "" {
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, status.Error(codes.Internal, "lookup verified identifier failed")
+	}
+	if user == "" {
 		return &proto.CheckResponse{
 			Response: proto.AuthorizationResponse_MESSAGE_TYPE_UNAUTHORIZED,
 			User:     "",
-		}, err
+		}, nil
 	}
 
 	return &proto.CheckResponse{
@@ -285,8 +290,8 @@ func (s *Server) handlePatchSession(writer http.ResponseWriter, request *http.Re
 		writeError(writer, http.StatusBadRequest, errNoNodeSpecified)
 		return
 	}
-	var slug *Slug
-	if err := json.NewDecoder(request.Body).Decode(&slug); err != nil {
+	var slug Slug
+	if err := json.NewDecoder(request.Body).Decode(&slug); err != nil || slug.Old == "" || slug.New == "" {
 		writeError(writer, http.StatusBadRequest, errRequestBody)
 		return
 	}
@@ -296,7 +301,7 @@ func (s *Server) handlePatchSession(writer http.ResponseWriter, request *http.Re
 		return
 	}
 
-	subscriber.events <- &proto.Events{
+	response, ok := s.deliverToNode(writer, request.Context(), subscriber, &proto.Events{
 		Type: proto.EventType_SLUG_CHANGE,
 		Payload: &proto.Events_SlugEvent{
 			SlugEvent: &proto.SlugChangeEvent{
@@ -305,27 +310,21 @@ func (s *Server) handlePatchSession(writer http.ResponseWriter, request *http.Re
 				New:  slug.New,
 			},
 		},
+	})
+	if !ok {
+		return
 	}
-
-	select {
-	case response := <-subscriber.node:
-		if response == nil {
-			writeError(writer, http.StatusInternalServerError, errUnexpectedNode)
-			return
-		}
-		resp, ok := response.Payload.(*proto.Node_SlugEventResponse)
-		if !ok {
-			writeError(writer, http.StatusInternalServerError, errUnexpectedNode)
-			return
-		}
-		if !resp.SlugEventResponse.Success {
-			writeError(writer, http.StatusBadRequest, resp.SlugEventResponse.Message)
-			return
-		}
-		log.Printf("Received slug change response: %v", response)
-		writer.WriteHeader(http.StatusNoContent)
-	case <-request.Context().Done():
+	resp, ok := response.Payload.(*proto.Node_SlugEventResponse)
+	if !ok || resp.SlugEventResponse == nil {
+		writeError(writer, http.StatusInternalServerError, errUnexpectedNode)
+		return
 	}
+	if !resp.SlugEventResponse.Success {
+		writeError(writer, http.StatusBadRequest, resp.SlugEventResponse.Message)
+		return
+	}
+	log.Printf("Received slug change response: %v", response)
+	writer.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleDeleteSession(writer http.ResponseWriter, request *http.Request, user string) {
@@ -355,7 +354,7 @@ func (s *Server) handleDeleteSession(writer http.ResponseWriter, request *http.R
 		writeError(writer, http.StatusBadRequest, errNoNode)
 		return
 	}
-	subscriber.events <- &proto.Events{
+	response, ok := s.deliverToNode(writer, request.Context(), subscriber, &proto.Events{
 		Type: proto.EventType_TERMINATE_SESSION,
 		Payload: &proto.Events_TerminateSessionEvent{
 			TerminateSessionEvent: &proto.TerminateSessionEvent{
@@ -364,26 +363,21 @@ func (s *Server) handleDeleteSession(writer http.ResponseWriter, request *http.R
 				Slug:       session,
 			},
 		},
+	})
+	if !ok {
+		return
 	}
-	select {
-	case response := <-subscriber.node:
-		if response == nil {
-			writeError(writer, http.StatusInternalServerError, errUnexpectedNode)
-			return
-		}
-		resp, ok := response.Payload.(*proto.Node_TerminateSessionEventResponse)
-		if !ok {
-			writeError(writer, http.StatusInternalServerError, errUnexpectedNode)
-			return
-		}
-		if !resp.TerminateSessionEventResponse.Success {
-			writeError(writer, http.StatusBadRequest, resp.TerminateSessionEventResponse.Message)
-			return
-		}
-		log.Printf("Received terminate session response: %v", response)
-		writer.WriteHeader(http.StatusNoContent)
-	case <-request.Context().Done():
+	resp, ok := response.Payload.(*proto.Node_TerminateSessionEventResponse)
+	if !ok || resp.TerminateSessionEventResponse == nil {
+		writeError(writer, http.StatusInternalServerError, errUnexpectedNode)
+		return
 	}
+	if !resp.TerminateSessionEventResponse.Success {
+		writeError(writer, http.StatusBadRequest, resp.TerminateSessionEventResponse.Message)
+		return
+	}
+	log.Printf("Received terminate session response: %v", response)
+	writer.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleGetSessions(writer http.ResponseWriter, request *http.Request, user string) {
@@ -460,7 +454,7 @@ func (s *Server) StartAPI(ctx context.Context, Addr string) error {
 	handler.HandleFunc("POST /api/auth/logout", s.handleLogout)
 	handler.HandleFunc("PATCH /api/session/{node}", s.withAuth(s.handlePatchSession))
 	handler.HandleFunc("DELETE /api/session/{node}/{type}/{session}", s.withAuth(s.handleDeleteSession))
-	handler.HandleFunc("/api/sessions", s.withAuth(s.handleGetSessions))
+	handler.HandleFunc("GET /api/sessions", s.withAuth(s.handleGetSessions))
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -592,6 +586,29 @@ func (s *Server) sendAndReceive(ctx context.Context, sub *Subscriber, req *proto
 		}
 		return resp, nil
 	}
+}
+
+func (s *Server) deliverToNode(writer http.ResponseWriter, ctx context.Context, sub *Subscriber, event *proto.Events) (*proto.Node, bool) {
+	response, err := s.sendAndReceive(ctx, sub, event, defaultSubscriberResponseWait)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, false
+		}
+		switch status.Code(err) {
+		case codes.DeadlineExceeded:
+			writeError(writer, http.StatusGatewayTimeout, errNodeTimeout)
+		case codes.Canceled:
+			writeError(writer, http.StatusBadGateway, errNoNode)
+		default:
+			writeError(writer, http.StatusInternalServerError, errUnexpectedNode)
+		}
+		return nil, false
+	}
+	if response == nil {
+		writeError(writer, http.StatusInternalServerError, errUnexpectedNode)
+		return nil, false
+	}
+	return response, true
 }
 
 func (s *Server) snapshotSubscribers() []*Subscriber {
