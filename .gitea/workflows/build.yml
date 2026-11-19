@@ -38,9 +38,8 @@ jobs:
 
       - name: Install psql
         run: |
-          if ! command -v psql >/dev/null; then
-            sudo apt-get update && sudo apt-get install -y postgresql-client
-          fi
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
 
       - name: Apply database migrations
         run: |
@@ -57,14 +56,93 @@ jobs:
           TP_TEST_DATABASE_URL: postgres://postgres:tp_test@postgres:5432/tp_test
         run: go test -v -p 4 ./...
 
-  build-and-push:
-    name: Build and Push Docker Image
+  build:
+    name: Build ${{ matrix.arch }} image
     runs-on: ubuntu-latest
     needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+          - platform: linux/arm64
+            arch: arm64
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Extract version and determine release type
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "Invalid version format: $VERSION"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+          echo "COMMIT=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "MAJOR=${VERSION%%.*}" >> "$GITHUB_OUTPUT"
+          MINOR="${VERSION#*.}"
+          echo "MINOR=${MINOR%%.*}" >> "$GITHUB_OUTPUT"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "IS_PRERELEASE=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "IS_PRERELEASE=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to Docker Registry
+        uses: docker/login-action@v4
+        with:
+          registry: git.fossy.my.id
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push by digest (${{ matrix.arch }})
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=git.fossy.my.id/${{ secrets.DOCKER_USERNAME }}/tunnel-please-controller,push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            VERSION=${{ steps.version.outputs.VERSION }}
+            BUILD_DATE=${{ steps.version.outputs.BUILD_DATE }}
+            COMMIT=${{ steps.version.outputs.COMMIT }}
+
+      - name: Export digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          touch "${{ runner.temp }}/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Create multi-architecture image
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download digest artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ runner.temp }}/digests
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -76,64 +154,47 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Extract version and determine release type
+      - name: Extract version and determine tags
         id: version
+        shell: bash
         run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
-          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
-          echo "BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
-          echo "COMMIT=${{ github.sha }}" >> $GITHUB_OUTPUT
-          
-          if echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
-            MAJOR=$(echo "$VERSION" | cut -d. -f1)
-            MINOR=$(echo "$VERSION" | cut -d. -f2)
-            PATCH=$(echo "$VERSION" | cut -d. -f3 | cut -d- -f1)
-          
-            echo "MAJOR=$MAJOR" >> $GITHUB_OUTPUT
-            echo "MINOR=$MINOR" >> $GITHUB_OUTPUT
-            echo "PATCH=$PATCH" >> $GITHUB_OUTPUT
-          
-            if echo "$VERSION" | grep -q '-'; then
-              PRERELEASE_TAG=$(echo "$VERSION" | cut -d- -f2 | cut -d. -f1)
-              echo "IS_PRERELEASE=true" >> $GITHUB_OUTPUT
-              echo "PRERELEASE_TAG=$PRERELEASE_TAG" >> $GITHUB_OUTPUT
-            else
-              echo "IS_PRERELEASE=false" >> $GITHUB_OUTPUT
-            fi
-          else
+          set -euo pipefail
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
             echo "Invalid version format: $VERSION"
             exit 1
           fi
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "MAJOR=${VERSION%%.*}" >> "$GITHUB_OUTPUT"
+          MINOR="${VERSION#*.}"
+          echo "MINOR=${MINOR%%.*}" >> "$GITHUB_OUTPUT"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "IS_PRERELEASE=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "IS_PRERELEASE=false" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Build and push Docker image (release)
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: true
-          tags: |
-            git.fossy.my.id/${{ secrets.DOCKER_USERNAME }}/tunnel-please-controller:v${{ steps.version.outputs.VERSION }}
-            git.fossy.my.id/${{ secrets.DOCKER_USERNAME }}/tunnel-please-controller:release
-            git.fossy.my.id/${{ secrets.DOCKER_USERNAME }}/tunnel-please-controller:v${{ steps.version.outputs.MAJOR }}.${{ steps.version.outputs.MINOR }}
-            git.fossy.my.id/${{ secrets.DOCKER_USERNAME }}/tunnel-please-controller:v${{ steps.version.outputs.MAJOR }}
-            git.fossy.my.id/${{ secrets.DOCKER_USERNAME }}/tunnel-please-controller:latest
-          platforms: linux/amd64,linux/arm64
-          build-args: |
-            VERSION=${{ steps.version.outputs.VERSION }}
-            BUILD_DATE=${{ steps.version.outputs.BUILD_DATE }}
-            COMMIT=${{ steps.version.outputs.COMMIT }}
-        if: steps.version.outputs.IS_PRERELEASE == 'false'
-
-      - name: Build and push Docker image (pre-release)
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: true
-          tags: |
-            git.fossy.my.id/${{ secrets.DOCKER_USERNAME }}/tunnel-please-controller:v${{ steps.version.outputs.VERSION }}
-            git.fossy.my.id/${{ secrets.DOCKER_USERNAME }}/tunnel-please-controller:staging
-          platforms: linux/amd64,linux/arm64
-          build-args: |
-            VERSION=${{ steps.version.outputs.VERSION }}
-            BUILD_DATE=${{ steps.version.outputs.BUILD_DATE }}
-            COMMIT=${{ steps.version.outputs.COMMIT }}
-        if: steps.version.outputs.IS_PRERELEASE == 'true'
+      - name: Create and push image manifest
+        working-directory: ${{ runner.temp }}/digests
+        shell: bash
+        env:
+          IMAGE: git.fossy.my.id/${{ secrets.DOCKER_USERNAME }}/tunnel-please-controller
+          VERSION: ${{ steps.version.outputs.VERSION }}
+          MAJOR: ${{ steps.version.outputs.MAJOR }}
+          MINOR: ${{ steps.version.outputs.MINOR }}
+          IS_PRERELEASE: ${{ steps.version.outputs.IS_PRERELEASE }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            tags=("v$VERSION" staging)
+          else
+            tags=("v$VERSION" release "v$MAJOR.$MINOR" "v$MAJOR" latest)
+          fi
+          for tag in "${tags[@]}"; do
+            args+=(--tag "$IMAGE:$tag")
+          done
+          for digest in */*; do
+            args+=("$IMAGE@sha256:${digest##*/}")
+          done
+          docker buildx imagetools create "${args[@]}"
