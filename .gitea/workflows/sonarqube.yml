@@ -50,7 +50,9 @@ jobs:
           done
 
       - name: Run go vet
-        run: go vet ./... 2>&1 | tee vet-results.txt
+        run: |
+          set -o pipefail
+          go vet ./... 2>&1 | tee vet-results.txt
 
       - name: Run tests with coverage
         env:
