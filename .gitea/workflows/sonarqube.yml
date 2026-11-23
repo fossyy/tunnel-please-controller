@@ -71,7 +71,7 @@ jobs:
             --output.checkstyle.path=golangci-lint-report.xml
 
       - name: SonarQube Scan
-        uses: SonarSource/sonarqube-scan-action@v8.5.0
+        uses: SonarSource/sonarqube-scan-action@v8.5.1
         env:
           SONAR_HOST_URL: ${{ secrets.SONARQUBE_HOST }}
           SONAR_TOKEN: ${{ secrets.SONARQUBE_TOKEN }}
